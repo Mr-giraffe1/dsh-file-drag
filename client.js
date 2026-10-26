@@ -15,6 +15,9 @@
  *   (`conversation.input.shell(sessionId).addFiles([reference], [])`), which is
  *   the same path the shipped OS-file drop uses, so the draft shows a real
  *   reference chip with correct spacing.
+ * - When a pending question or plan review replaces the composer, a drop on
+ *   that card types the mention into the question's free-text answer instead
+ *   (or explains why that particular card cannot take one).
  */
 window.__ModuleLoader__.load({
   id: 'dsh-file-drag',
@@ -22,14 +25,33 @@ window.__ModuleLoader__.load({
     const React = require('react');
     const h = React.createElement;
 
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const LOG = '[dsh-file-drag]';
     const DRAG_THRESHOLD_PX = 6;
     const CLICK_SUPPRESS_MS = 400;
     const ROW_SELECTOR = 'li[data-files-entry][data-files-path]';
     const TREE_BODY_SELECTOR = '[data-files-body]';
     const CARD_SELECTOR = '[data-composer-card]';
+    const QUESTION_FRAME_SELECTOR = '[data-question-key], [data-plan-review-key]';
+    const COMPOSER_REGION_SELECTOR = '[data-composer-seat], [data-conversation-region="composer"]';
+    const COMPOSER_SESSION_SELECTOR = '[data-conversation-session]';
     const MENTION_UNSAFE = /[\u0000-\u001f\u007f-\u009f"]/u;
+
+    /** Copy namespace and the short drop hints shown over a question takeover. */
+    const NS = 'fileDrag';
+    const UI_TEXT = {
+      zh: {
+        'answer.none': '这里没有可输入的回答框，无法插入引用',
+        'answer.locked': '回答正在提交，暂时无法插入引用',
+        'answer.failed': '无法把引用插入回答框',
+      },
+      en: {
+        'answer.none': 'This dialog has no answer field, so the reference cannot be inserted.',
+        'answer.locked': 'The answer is being submitted, so the reference cannot be inserted.',
+        'answer.failed': 'Could not insert the reference into the answer.',
+      },
+    };
+    let translate = (key) => UI_TEXT.en[key] ?? key;
 
     /** The client root context captured by `apply`; the gesture is browser-wide. */
     let pluginCtx = null;
@@ -98,6 +120,29 @@ window.__ModuleLoader__.load({
       publishDrag();
     }
 
+    let notice = null;
+    let noticeTimer = null;
+
+    /** Show one transient drop hint near the pointer. */
+    function showNotice(text, x, y) {
+      notice = { text, x, y };
+      if (noticeTimer !== null) clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(() => {
+        noticeTimer = null;
+        notice = null;
+        publishDrag();
+      }, 3200);
+      publishDrag();
+    }
+
+    function clearNotice() {
+      if (noticeTimer !== null) {
+        clearTimeout(noticeTimer);
+        noticeTimer = null;
+      }
+      notice = null;
+    }
+
     // ---------------------------------------------------------------------
     // Composer drop zones (one per mounted composer, session-scoped)
     // ---------------------------------------------------------------------
@@ -152,6 +197,117 @@ window.__ModuleLoader__.load({
       if (withFolderSlash === '' || withFolderSlash === '@') return null;
       if (MENTION_UNSAFE.test(withFolderSlash)) return null;
       return /\s/u.test(withFolderSlash) ? `@"${withFolderSlash}"` : `@${withFolderSlash}`;
+    }
+
+    /** The Session workspace of the conversation region, or the longest known root containing the path. */
+    function cwdForPath(path, sessionId) {
+      const ctx = pluginCtx;
+      const sessions = ctx === null ? undefined : ctx.get('sessions');
+      const byId = sessions?.list?.getSnapshot?.().byId ?? {};
+      const named = sessionId === undefined ? undefined : byId[sessionId]?.cwd;
+      if (typeof named === 'string' && named !== '') return named;
+      const normalized = normalizePath(path);
+      let best = '';
+      for (const summary of Object.values(byId)) {
+        const cwd = typeof summary?.cwd === 'string' ? normalizePath(summary.cwd).replace(/\/+$/, '') : '';
+        if (cwd !== '' && normalized.startsWith(`${cwd}/`) && cwd.length > best.length) best = cwd;
+      }
+      return best;
+    }
+
+    /**
+     * The active question / plan-review takeover under the pointer.
+     * Only the composer seat's own card counts; the read-only question rows in
+     * the transcript are never drop targets.
+     */
+    function questionTargetAt(x, y) {
+      if (typeof document.elementFromPoint !== 'function') return undefined;
+      const element = document.elementFromPoint(x, y);
+      if (element === null || element === undefined) return undefined;
+      const frame = typeof element.closest === 'function' ? element.closest(QUESTION_FRAME_SELECTOR) : null;
+      if (frame === null) return undefined;
+      if (frame.closest(COMPOSER_REGION_SELECTOR) === null) return undefined;
+      const card = frame.querySelector('section') ?? frame;
+      const box = card.getBoundingClientRect();
+      if (!(box.width > 0) || !(box.height > 0)) return undefined;
+      const region = frame.closest(COMPOSER_SESSION_SELECTOR);
+      const sessionId = region?.getAttribute('data-conversation-session') || undefined;
+      return {
+        frame,
+        field: frame.querySelector('textarea'),
+        sessionId,
+        rect: {
+          left: box.left,
+          top: box.top,
+          width: box.width,
+          height: box.height,
+          right: box.right,
+          bottom: box.bottom,
+        },
+      };
+    }
+
+    /** Type one mention into the question's free-text answer, keeping the controlled field in sync. */
+    function insertIntoAnswer(field, mention) {
+      try {
+        const wasActive = document.activeElement === field;
+        const value = typeof field.value === 'string' ? field.value : '';
+        const start = wasActive && typeof field.selectionStart === 'number' ? field.selectionStart : value.length;
+        const end = wasActive && typeof field.selectionEnd === 'number' ? field.selectionEnd : value.length;
+        const before = value.slice(0, start);
+        const after = value.slice(end);
+        const lead = before !== '' && !/\s$/u.test(before) ? ' ' : '';
+        const text = `${lead}${mention} `;
+        field.focus();
+        field.setSelectionRange(start, end);
+        let applied = false;
+        try {
+          applied = document.execCommand('insertText', false, text);
+        } catch (error) {
+          applied = false;
+        }
+        if (!applied) {
+          const next = `${before}${text}${after}`;
+          const descriptor = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+          if (descriptor !== undefined && descriptor.set !== undefined) descriptor.set.call(field, next);
+          else field.value = next;
+          field.dispatchEvent(new Event('input', { bubbles: true }));
+          try {
+            field.setSelectionRange(start + text.length, start + text.length);
+          } catch (error) {
+            // Selection is a nicety; the text is already in the field.
+          }
+        }
+        field.focus();
+        return true;
+      } catch (error) {
+        warn('answer-insert-failed', messageOf(error));
+        return false;
+      }
+    }
+
+    /** Drop one dragged row onto a question takeover, or explain why it cannot land. */
+    function dropOnQuestion(target, path, kind, x, y) {
+      const field = target.field;
+      if (field === null) {
+        showNotice(translate('answer.none'), x, y);
+        return false;
+      }
+      if (field.disabled || field.readOnly) {
+        showNotice(translate('answer.locked'), x, y);
+        return false;
+      }
+      const relative = relativize(path, cwdForPath(path, target.sessionId));
+      const mention = formatMention(relative, kind);
+      if (mention === null) {
+        warn('path-unsupported', path);
+        return false;
+      }
+      if (!insertIntoAnswer(field, mention)) {
+        showNotice(translate('answer.failed'), x, y);
+        return false;
+      }
+      return true;
     }
 
     // ---------------------------------------------------------------------
@@ -291,36 +447,61 @@ window.__ModuleLoader__.load({
       );
     }
 
-    /** Frame-wide drag feedback: the pointer ghost and the composer outline. */
+    /** Frame-wide drag feedback: the pointer ghost, the target outline, and drop hints. */
     function DragLayer() {
       React.useSyncExternalStore(subscribeDrag, dragVersionOf);
-      if (!drag.active) return null;
-      const zone = zoneAt(drag.x, drag.y);
-      const rect = zone === undefined ? null : zone.rect();
-      return h(
-        React.Fragment,
-        null,
-        rect === null
-          ? null
-          : h('div', {
-              className: 'fdr-ring',
+      const question = drag.active ? questionTargetAt(drag.x, drag.y) : undefined;
+      const zone = drag.active && question === undefined ? zoneAt(drag.x, drag.y) : undefined;
+      const rect = question !== undefined ? question.rect : zone === undefined ? null : zone.rect();
+      const pieces = [];
+      if (rect !== null) {
+        pieces.push(
+          h('div', {
+            key: 'ring',
+            className: 'fdr-ring',
+            style: {
+              left: `${rect.left}px`,
+              top: `${rect.top}px`,
+              width: `${rect.width}px`,
+              height: `${rect.height}px`,
+            },
+          }),
+        );
+      }
+      if (drag.active) {
+        pieces.push(
+          h(
+            'div',
+            {
+              key: 'ghost',
+              className: 'fdr-ghost',
+              style: { left: `${drag.x + 14}px`, top: `${drag.y + 12}px` },
+            },
+            glyph(drag.kind),
+            h('span', { className: 'fdr-ghost-name' }, drag.label),
+          ),
+        );
+      }
+      if (notice !== null) {
+        const maxLeft = (window.innerWidth || 0) - 316;
+        const maxTop = (window.innerHeight || 0) - 72;
+        pieces.push(
+          h(
+            'div',
+            {
+              key: 'notice',
+              className: 'fdr-notice',
+              role: 'status',
               style: {
-                left: `${rect.left}px`,
-                top: `${rect.top}px`,
-                width: `${rect.width}px`,
-                height: `${rect.height}px`,
+                left: `${Math.max(8, Math.min(notice.x + 14, maxLeft))}px`,
+                top: `${Math.max(8, Math.min(notice.y + 22, maxTop))}px`,
               },
-            }),
-        h(
-          'div',
-          {
-            className: 'fdr-ghost',
-            style: { left: `${drag.x + 14}px`, top: `${drag.y + 12}px` },
-          },
-          glyph(drag.kind),
-          h('span', { className: 'fdr-ghost-name' }, drag.label),
-        ),
-      );
+            },
+            notice.text,
+          ),
+        );
+      }
+      return pieces.length === 0 ? null : h(React.Fragment, null, pieces);
     }
 
     /** Publisher inside one composer card: its rectangle and its insert entry point. */
@@ -414,6 +595,7 @@ window.__ModuleLoader__.load({
           const dy = event.clientY - gesture.startY;
           if (dx * dx + dy * dy < DRAG_THRESHOLD_PX * DRAG_THRESHOLD_PX) return;
           gesture.started = true;
+          clearNotice();
           setDrag({
             active: true,
             x: event.clientX,
@@ -438,6 +620,11 @@ window.__ModuleLoader__.load({
         suppressClickUntil = Date.now() + CLICK_SUPPRESS_MS;
         clearDrag();
         if (!commit) return;
+        const question = questionTargetAt(clientX, clientY);
+        if (question !== undefined) {
+          dropOnQuestion(question, current.path, current.kind, clientX, clientY);
+          return;
+        }
         const zone = zoneAt(clientX, clientY);
         if (zone !== undefined) zone.insert(current.path, current.kind);
       }
@@ -488,6 +675,7 @@ window.__ModuleLoader__.load({
         document.removeEventListener('click', onClickCapture, true);
         window.removeEventListener('blur', onCancel);
         gesture = null;
+        clearNotice();
         clearDrag();
       };
     }
@@ -502,6 +690,7 @@ window.__ModuleLoader__.load({
 .fdr-ghost{position:fixed;z-index:2147483001;display:flex;align-items:center;gap:6px;max-width:280px;padding:6px 10px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.16);font-size:13px;line-height:1.4;pointer-events:none}
 .fdr-ghost-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fdr-glyph{flex:none;color:var(--dsw-alias-label-secondary)}
+.fdr-notice{position:fixed;z-index:2147483001;max-width:300px;padding:8px 12px;background:var(--dsw-alias-bg-overlay);color:var(--dsw-alias-label-primary);border:1px solid var(--dsw-alias-border-l2);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.16);font-size:13px;line-height:1.5;pointer-events:none}
 `;
 
     function installStyles() {
@@ -518,10 +707,12 @@ window.__ModuleLoader__.load({
     // Plugin
     // ---------------------------------------------------------------------
 
-    const inject = ['slots'];
+    const inject = ['slots', 'locale'];
 
     function apply(ctx) {
       pluginCtx = ctx;
+      ctx.effect(() => ctx.locale.register(NS, UI_TEXT), `${LOG}: dictionaries`);
+      translate = ctx.locale.bind(NS);
       console.info(`${LOG} loaded v${VERSION}`);
       ctx.effect(installStyles, `${LOG}: styles`);
       ctx.effect(installGesture, `${LOG}: pointer gesture`);
