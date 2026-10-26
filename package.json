@@ -1,0 +1,53 @@
+{
+  "name": "dsh-file-drag",
+  "version": "1.0.0",
+  "description": "Drag a file from the right Sidebar's file tree onto the composer to insert an @ file reference.",
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "cordis",
+    "plugin",
+    "drag-and-drop",
+    "file-reference"
+  ],
+  "license": "MIT",
+  "author": "Mr-giraffe1",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Mr-giraffe1/dsh-file-drag.git"
+  },
+  "homepage": "https://github.com/Mr-giraffe1/dsh-file-drag#readme",
+  "bugs": {
+    "url": "https://github.com/Mr-giraffe1/dsh-file-drag/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-sidebar-files",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

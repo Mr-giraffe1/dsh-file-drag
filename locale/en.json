@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Drag Files to Reference",
+    "description": "Drag a file or folder from the right file panel onto the composer to insert an @ reference."
+  }
+}
